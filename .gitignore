@@ -1,0 +1,11 @@
+# 컴파일된 파이썬 파일
+*.pyc
+__pycache__/
+
+/ppo_ultimate_model/
+
+/grid_env/
+/venv/
+/env/
+/.venv/
+/.env/
