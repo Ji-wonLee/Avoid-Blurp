@@ -3,136 +3,120 @@ import kymnasium as kym
 import numpy as np
 import os
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv 
+from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.utils import set_random_seed
 from typing import Any, Dict
+
+# --- 하이퍼파라미터 및 설정 ---
+TIMESTEPS = 2000000 
+MODEL_DIR = "./ppo_ultimate_model/" 
+SAVE_PATH = os.path.join(MODEL_DIR, "best_model.zip")
+# ------------------------------
 
 # ----------------------------------------------------
 # 1. kymnasium.Agent 상속 구현 
 # ----------------------------------------------------
 class PPOAgent(kym.Agent):
-    """PPO 에이전트를 위한 kymnasium Agent 래퍼."""
+    """
+    PPO 에이전트를 위한 kymnasium Agent 래퍼입니다.
+    """
     def __init__(self, model):
         self.model = model
         self.action_space = gym.spaces.Discrete(3)
 
     def act(self, observation: Any, info: Dict) -> int:
         obs_array = self._process_obs(observation)
-        # model.predict는 배치 형태로 처리하므로, 배치 차원(차원 0)이 필요합니다.
         action, _ = self.model.predict(obs_array, deterministic=True)
-        # IndexError 방지를 위해 .item()을 사용하여 스칼라 값을 안전하게 추출합니다.
-        return int(action.item())
+        return int(action.item()) 
 
     def _process_obs(self, observation: Dict) -> np.ndarray:
-        """
-        'custom' 딕셔너리 관측치를 SB3가 처리할 수 있는 단일 벡터로 변환합니다.
-        """
+        """관측치 딕셔너리를 단일 벡터로 변환합니다."""
         player_vec = observation["player"].flatten()
         enemies_vec = observation["enemies"].flatten()
-        # [NOTE] player_vec (5,) + enemies_vec (180,) = (185,)
         return np.concatenate([player_vec, enemies_vec], dtype=np.float32)
 
     @classmethod
     def load(cls, path: str) -> 'kym.Agent':
-        loaded_model = PPO.load(path)
+        env_for_load = DummyVecEnv([make_env])
+        # Learning Rate 0.0003으로 로드 시도
+        loaded_model = PPO.load(path, env=env_for_load, learning_rate=0.0003)
         return cls(loaded_model)
 
     def save(self, path: str):
         self.model.save(path)
 
 # ----------------------------------------------------
-# 2. 커스텀 환경 래퍼 및 보상 설계 (Reward Shaping 강화)
+# 2. 커스텀 환경 래퍼 (Boundary Penalty 상향)
 # ----------------------------------------------------
 class AvoidBlurpRewardWrapper(gym.RewardWrapper):
     """
-    Reward Shaping을 통해 벽 비비기 방지 및 멈춤(Action 0)을 유도합니다.
+    Reward Shaping을 통해 벽 비비기를 방지하고 움직임을 복구합니다.
     """
     def __init__(self, env):
         super().__init__(env)
-        self.LIVE_REWARD = 0.5  # 생존 보상 유지
-        self.HIGH_PENALTY_FACTOR = 5000.0 # 거리 페널티 계수 (충돌 회피)
-        self.BOUNDARY_PENALTY_FACTOR = 0.05 # 벽 비비기 방지 계수
-        self.ACTION_PENALTY = 0.05 # 불필요한 이동 방지 페널티
+        self.LIVE_REWARD = 0.5    # 매 스텝 생존 보상
+        self.DEATH_PENALTY = -100.0
+        
+        # ✅ FINAL ADJUSTMENT: Boundary Penalty Factor를 4배 상향
+        self.BOUNDARY_PENALTY_FACTOR = 0.2
+        self.LEFT_BOUNDARY = 0
+        self.RIGHT_BOUNDARY = 750
 
     def reward(self, rew):
         new_reward = self.LIVE_REWARD
-        action = self.env.unwrapped.last_action # 직전 행동 가져오기
         
-        # ObsWrapper가 저장한 원본 딕셔너리를 직접 읽어옵니다.
-        if not hasattr(self.env.unwrapped, 'last_raw_obs'):
+        try:
+            raw_obs = self.env.unwrapped.last_raw_obs
+            player_x = raw_obs["player"][0]
+        except AttributeError:
             return new_reward
+
+        # --- A. 벽 비비기/경계 페널티 ---
+        # 50px 경계 내에 있을 경우 페널티 부여
+        boundary_distance_left = player_x - self.LEFT_BOUNDARY
+        boundary_distance_right = self.RIGHT_BOUNDARY - player_x
+        
+        if boundary_distance_left < 50: 
+            # 왼쪽 경계에 가까울수록 더 큰 페널티 (0.2 * 거리)
+            new_reward -= self.BOUNDARY_PENALTY_FACTOR * (50 - boundary_distance_left)
+        
+        if boundary_distance_right < 50: 
+            # 오른쪽 경계에 가까울수록 더 큰 페널티
+            new_reward -= self.BOUNDARY_PENALTY_FACTOR * (50 - boundary_distance_right)
             
-        obs_original = self.env.unwrapped.last_raw_obs
-        player_x = obs_original["player"][0] # 마리오 X 좌표 (0~600)
-        
-        
-        # --- (A) 거리 기반 페널티 (충돌 회피 유도) ---
-        enemies = obs_original["enemies"]
-        min_dist_sq = float('inf')
-        
-        for enemy in enemies:
-            enemy_x, enemy_y = enemy[0], enemy[1]
-            if enemy_x != 0.0 or enemy_y != 0.0:
-                dist_sq = (player_x - enemy_x)**2 + (obs_original["player"][1] - enemy_y)**2
-                if dist_sq < min_dist_sq:
-                    min_dist_sq = dist_sq
-
-        if min_dist_sq != float('inf') and min_dist_sq > 1e-6:
-             new_reward -= (self.HIGH_PENALTY_FACTOR / min_dist_sq)
-
-
-        # --- (B) 벽 비비기/경계 페널티 (불안정성 해결) ---
-        # 화면 폭: 600, 마리오 너비: 약 50으로 가정
-        SCREEN_WIDTH = 600
-        PLAYER_WIDTH = 50
-        
-        # 왼쪽 경계(50px) 또는 오른쪽 경계(550px)에 가까워지면 페널티
-        if player_x < PLAYER_WIDTH * 1.5:  # 왼쪽 너무 가까움
-            new_reward -= self.BOUNDARY_PENALTY_FACTOR * (PLAYER_WIDTH * 1.5 - player_x)
-        elif player_x > SCREEN_WIDTH - (PLAYER_WIDTH * 1.5): # 오른쪽 너무 가까움
-            new_reward -= self.BOUNDARY_PENALTY_FACTOR * (player_x - (SCREEN_WIDTH - PLAYER_WIDTH * 1.5))
-
-
-        # --- (C) 불필요한 이동 페널티 (멈춤 유도) ---
-        # Action 1(좌) 또는 2(우)를 선택하면 작은 페널티를 부과
-        # Action 0(멈춤)은 페널티가 없어 상대적으로 가치가 올라갑니다.
-        if action != 0:
-             new_reward -= self.ACTION_PENALTY
-             
         return new_reward
 
-    # Env.step()이 호출될 때마다 직전 행동을 저장하기 위해 step 메서드 오버라이딩
-    def step(self, action):
-        self.env.unwrapped.last_action = action
-        return super().step(action)
-
-
 # ----------------------------------------------------
-# 3. 환경 관측치 변환 래퍼 (데이터 저장 로직 추가)
+# 3. 환경 관측치 변환 래퍼 (데이터 저장)
 # ----------------------------------------------------
 class AvoidBlurpObsWrapper(gym.ObservationWrapper):
-    """
-    RewardWrapper가 사용할 수 있도록 원본 딕셔너리와 마지막 Action을 저장합니다.
-    """
+    """원본 딕셔너리를 환경에 저장하고, SB3 학습을 위한 벡터 변환을 수행합니다."""
     def __init__(self, env):
         super().__init__(env)
-        # 마지막 행동을 저장할 변수 초기화
-        self.env.unwrapped.last_action = 0 
-        
-        obs_dim = 5 + (30 * 6) 
+        obs_dim = 5 + (30 * 6)
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
     def observation(self, obs):
-        # 원본 딕셔너리(obs)를 저장하여 RewardWrapper가 접근할 수 있도록 합니다.
         self.env.unwrapped.last_raw_obs = obs 
-        
         player_vec = obs["player"].flatten()
         enemies_vec = obs["enemies"].flatten()
         return np.concatenate([player_vec, enemies_vec], dtype=np.float32)
 
 # ----------------------------------------------------
-# 4. 훈련 함수 (최종 하이퍼파라미터 조정)
+# 4. Action 저장 래퍼 
+# ----------------------------------------------------
+class AvoidBlurpActionWrapper(gym.ActionWrapper):
+    """직전에 선택된 Action을 환경에 저장합니다."""
+    def __init__(self, env):
+        super().__init__(env)
+        self.env.unwrapped.last_action = 0 
+
+    def action(self, act):
+        self.env.unwrapped.last_action = act
+        return act
+
+# ----------------------------------------------------
+# 5. 환경 생성 및 훈련 함수
 # ----------------------------------------------------
 def make_env():
     """환경 인스턴스를 생성하고 래퍼를 적용합니다."""
@@ -143,54 +127,51 @@ def make_env():
         bgm=False,
         obs_type='custom'
     )
-    # 반드시 ObsWrapper -> RewardWrapper 순서로 래핑해야 RewardWrapper가 데이터에 접근 가능
+    env = AvoidBlurpActionWrapper(env)
     env = AvoidBlurpObsWrapper(env)
     env = AvoidBlurpRewardWrapper(env)
     return env
 
 def train():
-    # 시드 고정 및 환경 초기화
-    SEED = 42
-    set_random_seed(SEED)
-    
-    # 저장 경로 설정
-    MODEL_DIR = "./ppo_ultimate_model/"
     os.makedirs(MODEL_DIR, exist_ok=True)
-    SAVE_PATH = os.path.join(MODEL_DIR, "best_model.zip")
-
-    # 벡터화 환경 생성 시 환경 복사본을 4개 사용 
-    env = DummyVecEnv([lambda: make_env() for _ in range(4)]) 
     
-    print("--- 환경 생성 완료: ULTIMATE PPO 모델 훈련 시작 ---")
+    def make_env_wrapper():
+        return make_env()
 
-    # PPO Network 아키텍처 및 하이퍼파라미터 정의
-    net_arch = [dict(pi=[256, 256], vf=[256, 256])] 
-    
-    # [최종 조정] 학습률과 배치 사이즈 (과잉 행동 방지 및 안정성)
-    model = PPO(
-        "MlpPolicy", 
-        env, 
-        verbose=1, 
-        learning_rate=0.00005,    
-        gamma=0.999,             
-        n_steps=2048,            
-        batch_size=512,          
-        n_epochs=10,             
-        ent_coef=0.01,           
-        policy_kwargs=dict(net_arch=net_arch), 
-        device="auto"
-    )
+    # 모델 로드 시도 및 Critic 복구 로직
+    try:
+        env = DummyVecEnv([make_env_wrapper for _ in range(4)])
+        # 기존 모델 로드 시도 (Learning Rate 0.0003으로 강제)
+        model = PPO.load(SAVE_PATH, env=env, learning_rate=0.0003)
+        print(f"--- 기존 모델 로드 성공! ({SAVE_PATH}) Critic 복구 훈련을 시작합니다. ---")
+    except Exception:
+        # 모델 로드 실패 시 새로 시작 
+        env = DummyVecEnv([make_env_wrapper for _ in range(4)])
+        model = PPO(
+            "MlpPolicy", 
+            env, 
+            verbose=1, 
+            learning_rate=0.0003,      
+            gamma=0.999,
+            n_steps=1024,              
+            batch_size=256,            
+            n_epochs=10,               
+            ent_coef=0.05,             # ✅ Entropy 상향: 구석에 갇히지 않도록 탐험 강제
+            policy_kwargs=dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])]),
+            device="auto"
+        )
+        print("--- 모델 로드 실패 또는 파일 없음. 200만 스텝 새로운 훈련을 시작합니다. ---")
 
-    # 훈련 중 일정 간격으로 모델 저장 (Checkpoint)
+
+    # 훈련 중 일정 간격으로 모델 저장
     checkpoint_callback = CheckpointCallback(
         save_freq=40960, 
         save_path=MODEL_DIR,
         name_prefix="ppo_ultimate_checkpoint"
     )
     
-    # 총 스텝 수를 150만으로 설정
-    TIMESTEPS = 1500000 
-    model.learn(total_timesteps=TIMESTEPS, callback=checkpoint_callback)
+    # 훈련 목표 설정
+    model.learn(total_timesteps=TIMESTEPS, callback=checkpoint_callback, reset_num_timesteps=False)
 
     # 최종 모델 저장
     model.save(SAVE_PATH)
